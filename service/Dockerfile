@@ -4,7 +4,8 @@ WORKDIR /app
 COPY SimpleMem /app/SimpleMem
 COPY service /app/service
 
-RUN pip install --no-cache-dir -e /app/SimpleMem/OmniSimpleMem \
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu && \
+    pip install --no-cache-dir -e /app/SimpleMem/OmniSimpleMem \
     faiss-cpu Pillow fastapi uvicorn python-multipart
 
 WORKDIR /app/service

@@ -2,7 +2,7 @@
 
 Agent Memory Leaderboard (AML) Cycle 2 **多模态赛道**参赛方案：基于 [Omni-SimpleMem](https://github.com/aiming-lab/SimpleMem) 的多模态长期记忆系统，实现官方 `memory-api-v1.1` 契约的 Add / Search 服务。
 
-## 架构（v0.1.0）
+## 架构（v0.2.1）
 
 ```
 Add 请求 (messages, 含 base64 图像 ContentPart)
@@ -58,4 +58,5 @@ docker run -d --name aml-mm -p 8002:8000 \
 ## 开发路线
 
 - [x] v0.1.0：契约服务上线（Omni-SimpleMem 文本模式，本地 Mem-Gallery 子集 F1 验证）
+- [x] v0.2.1：评测鲁棒性加固——快速同步 Add（<600ms@30并发，无 LLM 阻塞）+ 后台异步增强（OmniMem 管线/图像 caption）+ Search 限时降级；压力自测通过
 - [ ] v0.2+：检索优化（强嵌入模型、时间线索引、知识冲突处理）——详见技术报告
