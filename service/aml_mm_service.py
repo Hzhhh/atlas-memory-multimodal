@@ -1,26 +1,25 @@
 # -*- coding: utf-8 -*-
-"""AML 多模态赛道参赛服务 v0.2（memory-api-v1.1）。
+"""AML 多模态赛道参赛服务 v0.2.4（memory-api-v1.1，严格契约对齐版）。
 
-v0.2 架构（针对官方评测 16 并发长跑优化，教训来自文本赛道 Full 失败诊断）：
-  同步 Add 快路径（<100ms 量级，无 LLM）：
-    原始轮次落盘(turns.jsonl) + MiniLM 嵌入入 FAISS + BM25 脏标记
-    → 返回 200 时内容已持久化且可检索（契约合规）
-  后台增强工作线程（LLM=gpt-4o-mini，官方要求）：
-    OmniMemAdapter.store 全管线（摘要/实体/图谱）异步补全；图像 caption 异步补全
-  Search：
-    OmniMem 增强层 recall + 原始层 BM25/向量混合检索合并
-    → 无论增强进度如何，原始内容永远可检索
+依据官方文档修正的三个关键点：
+  1) Add 响应必须含 success:true + request_id/user_id/session_id（逐一回显），
+     否则即使 HTTP 200 阶段也立即失败
+  2) Search 响应必须为 {"data":[{id, content, score?, created_at?}]}，
+     无结果返回空数组；不得超过 top_k
+  3) 检索隔离：Search 只能返回该 user_id 的记忆（跨用户违规）
+
+架构：同步快路径（落盘 + MiniLM 向量 + BM25，无 LLM）+ user_id 隔离检索。
+增强层（OmniMem LLM 管线）默认关闭（ENABLE_ENRICH=0）——其记忆为全局共享，
+无法按 user_id 隔离，开启有违规风险；后续做 per-user 分区后再启用。
 
 环境变量：
   OPENAI_API_KEY / OPENAI_API_BASE / AML_LLM_MODEL(openai/gpt-4o-mini)
   MEMORY_SYSTEM_KEY / DATA_DIR(默认 /data) / PORT(默认 8000)
-  ENRICH_WORKERS(默认 4)
+  ENABLE_ENRICH(默认 0；=1 时启用 OmniMem 后台增强，当前版本 Search 不消费)
 """
 import base64
-import concurrent.futures
 import json
 import os
-import queue
 import re
 import sys
 import threading
@@ -30,7 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 
 PROJ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OMNI_ROOT = os.path.join(PROJ, "SimpleMem", "OmniSimpleMem")
@@ -41,134 +40,125 @@ LLM_MODEL = os.environ.get("AML_LLM_MODEL", "openai/gpt-4o-mini")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 MEMORY_KEY = os.environ.get("MEMORY_SYSTEM_KEY", "")
 PORT = int(os.environ.get("PORT", "8000"))
-ENRICH_WORKERS = int(os.environ.get("ENRICH_WORKERS", "4"))
+ENABLE_ENRICH = os.environ.get("ENABLE_ENRICH", "0") == "1"
 MAX_BODY = 30 * 1024 * 1024
+# 相关性阈值：混合分低于此值的结果不返回；全部低于则返回空数组（支撑弃答 + 降噪）
+# 校准依据（平台真实英文数据）：相关 top1≈0.60+（清洁嵌入后更高），无关 top1≈0.43
+RELEVANCE_THRESHOLD = float(os.environ.get("RELEVANCE_THRESHOLD", "0.50"))
+
+_PREFIX_RE = re.compile(r"^\[[^\]]*\]\s*[a-zA-Z_]+\s*:\s*")
+
+
+def _clean_text(text: str) -> str:
+    """去掉 '[ts] role:' 前缀，得到干净内容（用于向量与 BM25，降低噪声）。"""
+    return "\n".join(_PREFIX_RE.sub("", ln) for ln in text.split("\n"))
 
 for sub in ("memory", "images", "hf"):
     (DATA_DIR / sub).mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("HF_HOME", str(DATA_DIR / "hf"))
-USAGE_LOG = DATA_DIR / "token_usage.jsonl"
 SEEN_LOG = DATA_DIR / "request_ids.jsonl"
 TURNS_LOG = DATA_DIR / "turns.jsonl"
-
-
-# ---- token 记账 ----
-def _install_usage_accounting() -> None:
-    try:
-        from openai.resources.chat.completions import Completions
-        _orig = Completions.create
-
-        def _create(self, *a, **kw):
-            resp = _orig(self, *a, **kw)
-            try:
-                u = getattr(resp, "usage", None)
-                if u is not None:
-                    with open(USAGE_LOG, "a", encoding="utf-8") as f:
-                        f.write(json.dumps({
-                            "ts": datetime.now().isoformat(timespec="seconds"),
-                            "model": getattr(resp, "model", kw.get("model", "?")),
-                            "in": u.prompt_tokens or 0,
-                            "out": u.completion_tokens or 0,
-                        }) + "\n")
-            except Exception:
-                pass
-            return resp
-
-        Completions.create = _create
-    except Exception:
-        pass
-
-
-_install_usage_accounting()
-from openai import OpenAI  # noqa: E402
-
-_client = OpenAI(
-    api_key=os.environ.get("OPENAI_API_KEY", ""),
-    base_url=os.environ.get("OPENAI_API_BASE", "https://openrouter.ai/api/v1"),
-)
 
 _DATAURI_RE = re.compile(r"^data:image/(jpeg|jpg|png|webp);base64,(.*)$", re.S)
 
 
-# ================= 原始层快速索引（同步路径，无 LLM） =================
+# ================= 原始层快速索引（同步路径，无 LLM，user_id 隔离） =================
 class FastIndex:
-    """turns.jsonl 持久化 + MiniLM/FAISS 向量 + BM25 词法混合检索。"""
+    """turns.jsonl 持久化 + MiniLM 向量 + BM25 混合检索，按 user_id 严格隔离。"""
 
     def __init__(self, data_dir: Path):
-        self.dir = data_dir
         self.lock = threading.Lock()
         self.turns: List[Dict] = []
-        self._bm25 = None
-        self._bm25_dirty = True
+        self.vecs: List[Any] = []
+        self.tokens: List[List[str]] = []
         from sentence_transformers import SentenceTransformer
-        import faiss
         import numpy as np
         self._np = np
-        self._faiss_mod = faiss
         self._model = SentenceTransformer("all-MiniLM-L6-v2")
-        self._index = faiss.IndexFlatIP(384)
         self._load()
 
     def _load(self):
+        np = self._np
+        missing = []
         if TURNS_LOG.exists():
             with open(TURNS_LOG, encoding="utf-8") as f:
                 for line in f:
                     try:
                         t = json.loads(line)
                         self.turns.append(t)
+                        self.tokens.append(self._tokenize(t.get("text_clean") or _clean_text(t["text"])))
+                        v = t.get("vec")
+                        if v:
+                            self.vecs.append(np.frombuffer(base64.b64decode(v), dtype=np.float32))
+                        else:
+                            self.vecs.append(None)
+                            missing.append(len(self.turns) - 1)
                     except Exception:
                         continue
-        if self.turns:
-            vecs = self._model.encode([t["text"] for t in self.turns],
-                                      normalize_embeddings=True, show_progress_bar=False)
-            self._index.add(self._np.asarray(vecs, dtype="float32"))
-            self._bm25_dirty = True
-
-    def add(self, turn: Dict):
-        vec = self._model.encode([turn["text"]], normalize_embeddings=True,
-                                 show_progress_bar=False)
-        with self.lock:
-            with open(TURNS_LOG, "a", encoding="utf-8") as f:
-                f.write(json.dumps(turn, ensure_ascii=False) + "\n")
-            self.turns.append(turn)
-            self._index.add(self._np.asarray(vec, dtype="float32"))
-            self._bm25_dirty = True
-
-    def _ensure_bm25(self):
-        if self._bm25_dirty or self._bm25 is None:
-            from rank_bm25 import BM25Okapi
-            corpus = [self._tokenize(t["text"]) for t in self.turns]
-            self._bm25 = BM25Okapi(corpus) if corpus else None
-            self._bm25_dirty = False
+        # 仅对无向量的旧数据重编码（新数据向量随行落盘，重启秒级恢复）
+        if missing:
+            texts = [self.turns[i].get("text_clean") or _clean_text(self.turns[i]["text"])
+                     for i in missing]
+            vecs = self._model.encode(texts, normalize_embeddings=True,
+                                      show_progress_bar=False)
+            for j, i in enumerate(missing):
+                self.vecs[i] = vecs[j]
 
     @staticmethod
     def _tokenize(text: str):
         return re.findall(r"[a-zA-Z0-9]+|[一-鿿]", text.lower())
 
-    def search(self, query: str, k: int = 30) -> List[Dict]:
+    def add(self, turn: Dict):
+        turn["text_clean"] = _clean_text(turn["text"])
+        vec = self._model.encode([turn["text_clean"]], normalize_embeddings=True,
+                                 show_progress_bar=False)[0]
+        turn["vec"] = base64.b64encode(vec.astype(self._np.float32).tobytes()).decode()
         with self.lock:
-            self._ensure_bm25()
-            n = len(self.turns)
-            if n == 0:
+            with open(TURNS_LOG, "a", encoding="utf-8") as f:
+                f.write(json.dumps(turn, ensure_ascii=False) + "\n")
+            self.turns.append(turn)
+            self.vecs.append(vec)
+            self.tokens.append(self._tokenize(turn["text_clean"]))
+
+    def search(self, query: str, user_id: str, k: int = 100) -> List[Dict]:
+        np = self._np
+        with self.lock:
+            idxs = [i for i, t in enumerate(self.turns)
+                    if t.get("user_id") == user_id]
+            if not idxs:
                 return []
             qv = self._model.encode([query], normalize_embeddings=True,
-                                    show_progress_bar=False)
-            _, dense_idx = self._index.search(self._np.asarray(qv, dtype="float32"),
-                                              min(n, max(k, 20)))
-            bm25_scores = (self._bm25.get_scores(self._tokenize(query))
-                           if self._bm25 is not None
-                           else self._np.zeros(n))
-            mx = float(bm25_scores.max()) if bm25_scores.size and bm25_scores.max() > 0 else 1.0
-            cand = set(int(i) for i in dense_idx[0] if 0 <= i < n)
-            top_bm = sorted(range(n), key=lambda i: -bm25_scores[i])[:max(k, 20)]
-            cand.update(top_bm)
-            scored = []
-            for i in cand:
-                hybrid = 0.6 * (i in set(int(x) for x in dense_idx[0])) + \
-                         0.4 * (bm25_scores[i] / mx if mx > 0 else 0.0)
-                scored.append((hybrid, i))
-            scored.sort(reverse=True)
-            return [self.turns[i] for _, i in scored[:k]]
+                                    show_progress_bar=False)[0]
+            sub_tokens = [self.tokens[i] for i in idxs]
+            dense = {i: float(np.dot(self.vecs[i], qv)) for i in idxs}
+            tokens_q = self._tokenize(query)
+            bm25_s = {i: 0.0 for i in idxs}
+            if any(sub_tokens):
+                from rank_bm25 import BM25Okapi
+                bm25 = BM25Okapi(sub_tokens)
+                s = bm25.get_scores(tokens_q)
+                mx = float(s.max()) if s.size and s.max() > 0 else 0.0
+                for j, i in enumerate(idxs):
+                    # 负分夹到 0（BM25 在小语料上可能为负），正分按 max 归一到 [0,1]
+                    bm25_s[i] = max(0.0, float(s[j]) / mx) if mx > 0 else 0.0
+            # 混合分下限保护：语义余弦是校准通道，弱词汇证据不应把高语义拉下阈值
+            scored = sorted(
+                ((max(0.6 * dense[i] + 0.4 * bm25_s[i], dense[i]), i) for i in idxs),
+                reverse=True)
+            out = []
+            for rank, (sc, i) in enumerate(scored, 1):
+                if len(out) >= k:
+                    break
+                if sc < RELEVANCE_THRESHOLD:
+                    continue  # 低相关结果不返回：无相关记忆时返回空数组，支撑答题侧弃答
+                t = self.turns[i]
+                out.append({
+                    "id": str(t.get("request_id") or f"turn-{i}"),
+                    "content": t["text"],
+                    "score": round(max(0.0, min(1.0, sc)), 4),
+                    "created_at": t.get("ts", ""),
+                })
+            return out
 
     def __len__(self):
         return len(self.turns)
@@ -176,94 +166,23 @@ class FastIndex:
 
 _FAST = FastIndex(DATA_DIR)
 
-# ================= 增强层（后台，OmniMem 全管线） =================
-from benchmarks.memgallery.adapter import OmniMemAdapter  # noqa: E402
-from omni_memory import OmniMemoryConfig  # noqa: E402
-
-
-def _build_memory():
-    cfg = OmniMemoryConfig.create_default()
-    cfg.set_unified_model(LLM_MODEL)
-    cfg.embedding.model_name = "all-MiniLM-L6-v2"
-    cfg.embedding.embedding_dim = 384
-    return OmniMemAdapter(data_dir=str(DATA_DIR / "memory"), config=cfg)
-
-
-_ADAPTER = _build_memory()
+# ================= 增强层（默认关闭；开启时仅后台异步增强，不影响契约响应） =================
+_ADAPTER = None
 _ADAPTER_LOCK = threading.Lock()
 
-_enrich_q: "queue.Queue[Dict]" = queue.Queue()
-_ENRICHED_IDS = set()
-_enrich_log = DATA_DIR / "enriched_ids.jsonl"
-if _enrich_log.exists():
-    with open(_enrich_log, encoding="utf-8") as f:
-        for line in f:
-            try:
-                _ENRICHED_IDS.add(json.loads(line)["request_id"])
-            except Exception:
-                pass
+if ENABLE_ENRICH:
+    from benchmarks.memgallery.adapter import OmniMemAdapter  # noqa: E402
+    from omni_memory import OmniMemoryConfig as _OmniCfg  # noqa: E402
 
-
-def _enrich_worker():
-    while True:
-        item = _enrich_q.get()
-        if item is None:
-            return
-        try:
-            rid = item["request_id"]
-            if rid in _ENRICHED_IDS:
-                continue
-            if item.get("caption_job"):
-                # 图像 caption 补全
-                info = _caption_image_llm(item["caption_job"])
-                text = (f"image detail (request {rid}):\nimage_id: {info['img_id']}\n"
-                        f"image_caption: {info['caption']}")
-                with _ADAPTER_LOCK:
-                    _ADAPTER.store({"text": text, "image": None,
-                                    "timestamp": item.get("ts", ""),
-                                    "dialogue_id": f"caption:{rid}"})
-            else:
-                with _ADAPTER_LOCK:
-                    _ADAPTER.store(item["observation"])
-            with open(_enrich_log, "a", encoding="utf-8") as f:
-                f.write(json.dumps({"request_id": rid}) + "\n")
-            _ENRICHED_IDS.add(rid)
-        except Exception:
-            pass  # 增强失败不影响原始层可检索性
-        finally:
-            _enrich_q.task_done()
-
-
-for _ in range(ENRICH_WORKERS):
-    threading.Thread(target=_enrich_worker, daemon=True).start()
-
-
-def _caption_image_llm(data_uri: str) -> Dict[str, str]:
-    m = _DATAURI_RE.match(data_uri.strip())
-    if not m:
-        return {"img_id": "invalid", "caption": ""}
-    ext = {"jpg": "jpeg"}.get(m.group(1), m.group(1))
-    raw = base64.b64decode(m.group(2))
-    img_id = uuid.uuid4().hex[:16]
-    (DATA_DIR / "images" / f"{img_id}.{ext}").write_bytes(raw)
-    try:
-        resp = _client.chat.completions.create(
-            model=LLM_MODEL, temperature=0.0, max_tokens=220,
-            messages=[{"role": "user", "content": [
-                {"type": "text",
-                 "text": "Describe this image concisely for a long-term memory system: "
-                         "objects, people, visible text (OCR), scene, notable details."},
-                {"type": "image_url", "image_url": {"url": data_uri}},
-            ]}],
-        )
-        caption = (resp.choices[0].message.content or "").strip()
-    except Exception as e:
-        caption = f"(caption unavailable: {type(e).__name__})"
-    return {"img_id": img_id, "caption": caption}
+    _cfg = _OmniCfg.create_default()
+    _cfg.set_unified_model(LLM_MODEL)
+    _cfg.embedding.model_name = "all-MiniLM-L6-v2"
+    _cfg.embedding.embedding_dim = 384
+    _ADAPTER = OmniMemAdapter(data_dir=str(DATA_DIR / "memory"), config=_cfg)
 
 
 def _content_to_parts(content: Any) -> Dict[str, Any]:
-    """ContentPart[]/字符串 → {text, images: [data_uri]}（同步路径不做任何 LLM）。"""
+    """ContentPart[]/字符串 → {text, images:[data_uri]}（同步路径不做任何 LLM）。"""
     if content is None:
         return {"text": "", "images": []}
     if isinstance(content, str):
@@ -289,7 +208,7 @@ def _content_to_parts(content: Any) -> Dict[str, Any]:
                 img_id = uuid.uuid4().hex[:16]
                 ext = {"jpg": "jpeg"}.get(m.group(1), m.group(1))
                 (DATA_DIR / "images" / f"{img_id}.{ext}").write_bytes(raw)
-                texts.append(f"[image: {img_id} (caption pending)]")
+                texts.append(f"[image: {img_id}]")
                 images.append(url)
     return {"text": "\n".join(x for x in texts if x), "images": images}
 
@@ -304,7 +223,7 @@ if SEEN_LOG.exists():
             except Exception:
                 pass
 
-app = FastAPI(title="AML Multimodal Memory Service", version="0.2.0")
+app = FastAPI(title="AML Multimodal Memory Service", version="0.2.4")
 
 
 def _check_auth(request: Request) -> None:
@@ -337,14 +256,11 @@ def _ts_to_iso(ts) -> str:
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model": LLM_MODEL, "service": "aml-multimodal-v0.2",
-            "turns": len(_FAST), "enriched": len(_ENRICHED_IDS)}
+    return {"status": "ok", "model": LLM_MODEL, "service": "aml-multimodal-v0.2.4",
+            "turns": len(_FAST)}
 
 
-# ---- HEAD 探活支持：平台用 HEAD 探测绑定的 Add/Search 端点（FastAPI POST 路由默认 405） ----
-from fastapi import Response  # noqa: E402
-
-
+# ---- HEAD 探活：平台用 HEAD 探测绑定的 Add/Search 端点 ----
 @app.head("/v1/memory/add")
 @app.head("/v1/memory/ad")
 @app.head("/v1/memory/search")
@@ -355,7 +271,7 @@ async def head_ok():
 
 
 @app.post("/v1/memory/add")
-@app.post("/v1/memory/ad")   # 别名：兼容已绑定版本中 Add 地址的笔误（少个 d，端点在 Key 层冻结不可改）
+@app.post("/v1/memory/ad")   # 别名：兼容已绑定版本 Add 地址的笔误（端点在 Key 层冻结）
 @app.post("/add")
 async def memory_add(request: Request):
     _check_auth(request)
@@ -370,56 +286,40 @@ async def memory_add(request: Request):
         raise HTTPException(400, f"invalid JSON: {e}")
 
     request_id = str(payload.get("request_id") or uuid.uuid4().hex)
+    user_id = str(payload.get("user_id") or "")
+    session_id = str(payload.get("session_id") or "")
+    if not user_id or not session_id:
+        raise HTTPException(400, "user_id and session_id are required")
+
     if request_id in _seen_ids:
-        return {"status": "ok", "request_id": request_id, "duplicate": True}
+        return {"success": True, "request_id": request_id,
+                "user_id": user_id, "session_id": session_id, "duplicate": True}
 
     messages = payload.get("messages") or []
-    session_id = str(payload.get("session_id") or "default_session")
     ts_iso = _ts_to_iso(payload.get("timestamp"))
 
-    text_parts, image_uris = [], []
+    text_parts = []
     for msg in messages:
         if not isinstance(msg, dict):
             continue
         role = msg.get("role", "user")
+        msg_ts = _ts_to_iso(msg.get("timestamp")) if msg.get("timestamp") else ts_iso
         parsed = _content_to_parts(msg.get("content"))
         if parsed["text"]:
-            text_parts.append(f"{role}: {parsed['text']}")
-        image_uris.extend(parsed["images"])
+            text_parts.append(f"[{msg_ts}] {role}: {parsed['text']}")
     text = "\n".join(text_parts)
 
-    turn = {"request_id": request_id, "session_id": session_id, "ts": ts_iso, "text": text}
-
-    # —— 同步快路径：持久化 + 可检索，然后立刻 200 ——
     if text:
-        _FAST.add(turn)
+        _FAST.add({"request_id": request_id, "user_id": user_id,
+                   "session_id": session_id, "ts": ts_iso, "text": text})
 
     with open(SEEN_LOG, "a", encoding="utf-8") as f:
         f.write(json.dumps({"request_id": request_id, "ts": ts_iso}) + "\n")
     _seen_ids.add(request_id)
 
-    # —— 异步增强：OmniMem 全管线 + 图像 caption ——
-    if text:
-        _enrich_q.put({"request_id": request_id, "observation": {
-            "text": text, "image": None, "timestamp": ts_iso,
-            "dialogue_id": f"{session_id}:{request_id}"}})
-    for uri in image_uris:
-        _enrich_q.put({"request_id": f"{request_id}:cap{len(image_uris)}",
-                       "caption_job": uri, "ts": ts_iso})
-
-    return {"status": "ok", "request_id": request_id}
-
-
-_RECALL_POOL = concurrent.futures.ThreadPoolExecutor(2, thread_name_prefix="recall")
-
-
-def _adapter_recall_safe(qtext: str, lock_timeout: float = 3.0) -> str:
-    if not _ADAPTER_LOCK.acquire(timeout=lock_timeout):
-        return ""  # 增强层忙（后台enrichment持有锁）→ 降级原始层
-    try:
-        return _ADAPTER.recall(qtext) or ""
-    finally:
-        _ADAPTER_LOCK.release()
+    # 契约要求的成功响应：success + 三个 ID 逐一回显
+    return {"success": True, "request_id": request_id,
+            "user_id": user_id, "session_id": session_id}
 
 
 @app.post("/v1/memory/search")
@@ -436,30 +336,31 @@ async def memory_search(request: Request):
     except Exception as e:
         raise HTTPException(400, f"invalid JSON: {e}")
 
+    user_id = str(payload.get("user_id") or "")
+    if not user_id:
+        raise HTTPException(400, "user_id is required")
+
     query = payload.get("query", "")
-    qtext = str(query) if not isinstance(query, list) else _content_to_parts(query)["text"]
+    if isinstance(query, list):
+        qtext = _content_to_parts(query)["text"]
+    else:
+        qtext = str(query)
+    options = payload.get("options")
+    if isinstance(options, list) and options:
+        qtext += "\noptions: " + " | ".join(str(o) for o in options)
     if not qtext:
         raise HTTPException(400, "empty query")
-    top_k = int(payload.get("top_k") or 100)
 
-    raw_turns = _FAST.search(qtext, k=min(30, max(10, top_k // 3)))
-
-    context_parts = []
+    top_k = payload.get("top_k")
     try:
-        fut = _RECALL_POOL.submit(_adapter_recall_safe, qtext)
-        enriched_ctx = fut.result(timeout=10)  # 超时降级：只用原始层
-        if enriched_ctx:
-            context_parts.append(enriched_ctx)
+        top_k = int(top_k) if top_k is not None else 100
     except Exception:
-        pass
-    if raw_turns:
-        lines = [f"[{i+1}] TURN:{t['request_id']} | SESSION:{t['session_id']} | "
-                 f"DATE:{t['ts']}\n{t['text']}"
-                 for i, t in enumerate(raw_turns)]
-        context_parts.append("\n\n".join(lines))
-    context = "\n\n========\n\n".join(context_parts)
+        top_k = 100
+    top_k = max(1, min(top_k, 200))
 
-    return {"data": [{"type": "text", "text": context}], "top_k": top_k}
+    # 契约响应：data 数组 + id/content 必填；严格 user_id 隔离；数量 ≤ top_k
+    data = _FAST.search(qtext, user_id=user_id, k=top_k)
+    return {"data": data}
 
 
 if __name__ == "__main__":
