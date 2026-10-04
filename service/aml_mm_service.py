@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""AML 多模态赛道参赛服务 v0.2.4（memory-api-v1.1，严格契约对齐版）。
+"""AML 多模态赛道参赛服务 v0.2.9（memory-api-v1.1，严格契约对齐版）。
 
 依据官方文档修正的三个关键点：
   1) Add 响应必须含 success:true + request_id/user_id/session_id（逐一回显），
@@ -16,6 +16,9 @@
   OPENAI_API_KEY / OPENAI_API_BASE / AML_LLM_MODEL(openai/gpt-4o-mini)
   MEMORY_SYSTEM_KEY / DATA_DIR(默认 /data) / PORT(默认 8000)
   ENABLE_ENRICH(默认 0；=1 时启用 OmniMem 后台增强，当前版本 Search 不消费)
+
+v0.2.9：新增查询日志 DATA_DIR/searches.jsonl——记录每次 Search 的 query、
+阈值过滤前 top8 原始分、返回条数（弃答阈值校准数据，官方冒烟/评测时自动产出）。
 """
 import base64
 import json
@@ -58,6 +61,7 @@ for sub in ("memory", "images", "hf"):
 os.environ.setdefault("HF_HOME", str(DATA_DIR / "hf"))
 SEEN_LOG = DATA_DIR / "request_ids.jsonl"
 TURNS_LOG = DATA_DIR / "turns.jsonl"
+SEARCH_LOG = DATA_DIR / "searches.jsonl"
 
 _DATAURI_RE = re.compile(r"^data:image/(jpeg|jpg|png|webp);base64,(.*)$", re.S)
 
@@ -126,6 +130,7 @@ class FastIndex:
             idxs = [i for i, t in enumerate(self.turns)
                     if t.get("user_id") == user_id]
             if not idxs:
+                self._log_query(query, user_id, k, [], 0)
                 return []
             qv = self._model.encode([query], normalize_embeddings=True,
                                     show_progress_bar=False)[0]
@@ -145,6 +150,9 @@ class FastIndex:
             scored = sorted(
                 ((max(0.6 * dense[i] + 0.4 * bm25_s[i], dense[i]), i) for i in idxs),
                 reverse=True)
+            # 阈值过滤前的原始 top 分数（弃答校准：无关查询的真实分数分布）
+            raw_top = [(round(sc, 4), str(self.turns[i].get("request_id") or f"turn-{i}"))
+                       for sc, i in scored[:8]]
             out = []
             for rank, (sc, i) in enumerate(scored, 1):
                 if len(out) >= k:
@@ -158,7 +166,25 @@ class FastIndex:
                     "score": round(max(0.0, min(1.0, sc)), 4),
                     "created_at": t.get("ts", ""),
                 })
+            self._log_query(query, user_id, k, raw_top, len(out))
             return out
+
+    @staticmethod
+    def _log_query(query: str, user_id: str, k: int, raw_top: List, n_returned: int):
+        """查询日志：真实 query + 阈值过滤前 top 分数，供弃答阈值离线校准。"""
+        try:
+            with open(SEARCH_LOG, "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "user_id": user_id,
+                    "query": query[:2000],
+                    "top_k": k,
+                    "raw_top": raw_top,
+                    "returned": n_returned,
+                    "threshold": RELEVANCE_THRESHOLD,
+                }, ensure_ascii=False) + "\n")
+        except Exception:
+            pass  # 日志失败不影响契约响应
 
     def __len__(self):
         return len(self.turns)
@@ -223,7 +249,7 @@ if SEEN_LOG.exists():
             except Exception:
                 pass
 
-app = FastAPI(title="AML Multimodal Memory Service", version="0.2.4")
+app = FastAPI(title="AML Multimodal Memory Service", version="0.2.9")
 
 
 def _check_auth(request: Request) -> None:
@@ -256,7 +282,7 @@ def _ts_to_iso(ts) -> str:
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model": LLM_MODEL, "service": "aml-multimodal-v0.2.4",
+    return {"status": "ok", "model": LLM_MODEL, "service": "aml-multimodal-v0.2.9",
             "turns": len(_FAST)}
 
 
