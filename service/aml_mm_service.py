@@ -341,6 +341,19 @@ async def health():
             "turns": len(_FAST), "enriched": len(_ENRICHED_IDS)}
 
 
+# ---- HEAD 探活支持：平台用 HEAD 探测绑定的 Add/Search 端点（FastAPI POST 路由默认 405） ----
+from fastapi import Response  # noqa: E402
+
+
+@app.head("/v1/memory/add")
+@app.head("/v1/memory/ad")
+@app.head("/v1/memory/search")
+@app.head("/add")
+@app.head("/search")
+async def head_ok():
+    return Response(status_code=200)
+
+
 @app.post("/v1/memory/add")
 @app.post("/v1/memory/ad")   # 别名：兼容已绑定版本中 Add 地址的笔误（少个 d，端点在 Key 层冻结不可改）
 @app.post("/add")
