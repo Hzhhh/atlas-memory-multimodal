@@ -17,7 +17,7 @@ Search 请求 (query, 支持文本与图像)
 {"data": [{"content": "<检索上下文>"}]}
 ```
 
-- **模型合规**：Add 与 Search 阶段全部 LLM 调用使用 `gpt-4o-mini`（官方要求，见服务环境变量 `AML_LLM_MODEL`）
+- **模型合规**：本版本（v0.2.x）Add 与 Search 阶段**不调用任何 LLM**；检索基于本地嵌入与 BM25 混合评分。未使用任何超过 gpt-4o-mini 能力的模型，符合开源组模型上限规则（服务预留 `AML_LLM_MODEL=openai/gpt-4o-mini` 配置用于后续增强层）
 - **嵌入**：all-MiniLM-L6-v2（本地，官方允许自由选择嵌入模型）
 - **幂等**：按 `request_id` 去重（重启后仍有效，落盘于 `/data/request_ids.jsonl`）
 - **鉴权**：`Authorization: Token/Bearer <key>` 或 `X-Api-Key: <key>`
