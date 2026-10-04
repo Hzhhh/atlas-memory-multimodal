@@ -304,7 +304,7 @@ if SEEN_LOG.exists():
             except Exception:
                 pass
 
-app = FastAPI(title="AML Multimodal Memory Service", version="0.2.1")
+app = FastAPI(title="AML Multimodal Memory Service", version="0.2.0")
 
 
 def _check_auth(request: Request) -> None:
@@ -342,6 +342,7 @@ async def health():
 
 
 @app.post("/v1/memory/add")
+@app.post("/v1/memory/ad")   # 别名：兼容已绑定版本中 Add 地址的笔误（少个 d，端点在 Key 层冻结不可改）
 @app.post("/add")
 async def memory_add(request: Request):
     _check_auth(request)
