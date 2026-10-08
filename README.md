@@ -17,8 +17,8 @@ Search 请求 (query, 支持文本与图像)
 {"data": [{"content": "<检索上下文>"}]}
 ```
 
-- **模型合规**：本版本（v0.2.x）Add 与 Search 阶段**不调用任何 LLM**；检索基于本地嵌入与 BM25 混合评分。未使用任何超过 gpt-4o-mini 能力的模型，符合开源组模型上限规则（服务预留 `AML_LLM_MODEL=openai/gpt-4o-mini` 配置用于后续增强层）
-- **嵌入**：all-MiniLM-L6-v2（本地，官方允许自由选择嵌入模型）
+- **模型合规**：本版本（v0.3.x）Add 与 Search 阶段**不调用任何 LLM**；检索基于本地嵌入与 BM25 混合评分。未使用任何超过 gpt-4o-mini 能力的模型，符合开源组模型上限规则（服务预留 `AML_LLM_MODEL=openai/gpt-4o-mini` 配置用于后续增强层）
+- **嵌入**：BAAI/bge-m3（max_seq 512，本地推理；官方允许自由选择嵌入模型）
 - **幂等**：按 `request_id` 去重（重启后仍有效，落盘于 `/data/request_ids.jsonl`）
 - **鉴权**：`Authorization: Token/Bearer <key>` 或 `X-Api-Key: <key>`
 
@@ -59,4 +59,5 @@ docker run -d --name aml-mm -p 8002:8000 \
 
 - [x] v0.1.0：契约服务上线（Omni-SimpleMem 文本模式，本地 Mem-Gallery 子集 F1 验证）
 - [x] v0.2.1：评测鲁棒性加固——快速同步 Add（<600ms@30并发，无 LLM 阻塞）+ 后台异步增强（OmniMem 管线/图像 caption）+ Search 限时降级；压力自测通过
-- [ ] v0.2+：检索优化（强嵌入模型、时间线索引、知识冲突处理）——详见技术报告
+- [x] v0.3.0：自适应切分（≥2KB 大块 → 消息/caption 检索单元，小 turn 整块）+ bge-m3 嵌入 + 异步编码写入管线（30 并发 p99=563ms）+ BM25 主导混合与父 turn 聚合窗口返回；11 轮离线门禁实验定稿（详见 tasks/experiments.md 评审记录）
+- [ ] v0.3+：时间线索引、知识冲突消解、弃答校准（W4）——十月冲刺中
