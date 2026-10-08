@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""AML 多模态赛道参赛服务 v0.2.9（memory-api-v1.1，严格契约对齐版）。
+"""AML 多模态赛道参赛服务 v0.3.0（memory-api-v1.1，严格契约对齐版）。
 
 依据官方文档修正的三个关键点：
   1) Add 响应必须含 success:true + request_id/user_id/session_id（逐一回显），
@@ -19,6 +19,12 @@
 
 v0.2.9：新增查询日志 DATA_DIR/searches.jsonl——记录每次 Search 的 query、
 阈值过滤前 top8 原始分、返回条数（弃答阈值校准数据，官方冒烟/评测时自动产出）。
+
+v0.3.0（W2 切分）：大块 turn → 检索单元。Add 的每条消息独立成 msg 单元、
+每段 Image Caption 额外独立成 caption 单元（消息行保留原文）；Search 返回
+1~2KB 干净单元证据（created_at=消息级时间戳）。按 user 缓存稠密矩阵与 BM25
+（新行到达即失效），加载后释放内存中的 b64 向量串。旧 turns.jsonl 用
+tasks/migrate_chunked.py 迁移。契约行为（请求/响应 schema、幂等、隔离）不变。
 """
 import base64
 import json
@@ -28,6 +34,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -40,6 +47,10 @@ if OMNI_ROOT not in sys.path:
     sys.path.insert(0, OMNI_ROOT)
 
 LLM_MODEL = os.environ.get("AML_LLM_MODEL", "openai/gpt-4o-mini")
+# 嵌入模型可配置（官方允许自由选择嵌入模型；W1 起支持 AML_EMBED_MODEL 切换 A/B）
+EMBED_MODEL = os.environ.get("AML_EMBED_MODEL", "all-MiniLM-L6-v2")
+# 嵌入截断长度（0=模型默认；bge-m3 默认 8192 在 CPU 上过慢，512 为生产候选）
+EMBED_MAXSEQ = int(os.environ.get("AML_EMBED_MAXSEQ", "0"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 MEMORY_KEY = os.environ.get("MEMORY_SYSTEM_KEY", "")
 PORT = int(os.environ.get("PORT", "8000"))
@@ -48,6 +59,13 @@ MAX_BODY = 30 * 1024 * 1024
 # 相关性阈值：混合分低于此值的结果不返回；全部低于则返回空数组（支撑弃答 + 降噪）
 # 校准依据（平台真实英文数据）：相关 top1≈0.60+（清洁嵌入后更高），无关 top1≈0.43
 RELEVANCE_THRESHOLD = float(os.environ.get("RELEVANCE_THRESHOLD", "0.50"))
+# 混合权重（v0.3.0 终版回归 0.6/0.4+floor：W1/W2 十一轮实验证明该公式在
+# 整块小 turn 上最优；RRF/线性变体已证伪并归档于 tasks/experiments.md）
+HYBRID_DENSE = float(os.environ.get("AML_HYBRID_DENSE", "0.6"))
+HYBRID_BM25 = float(os.environ.get("AML_HYBRID_BM25", "0.4"))
+# 自适应切分阈值：文本短于此值保持整块（Mem-Gallery 类一问一答 turn 切分反伤），
+# 长于此值（官方 16KB 会话块）才切分为 msg/caption 单元（治稀释）
+CHUNK_MIN_CHARS = int(os.environ.get("AML_CHUNK_MIN_CHARS", "2000"))
 
 _PREFIX_RE = re.compile(r"^\[[^\]]*\]\s*[a-zA-Z_]+\s*:\s*")
 
@@ -64,22 +82,94 @@ TURNS_LOG = DATA_DIR / "turns.jsonl"
 SEARCH_LOG = DATA_DIR / "searches.jsonl"
 
 _DATAURI_RE = re.compile(r"^data:image/(jpeg|jpg|png|webp);base64,(.*)$", re.S)
+# W2 切分：caption 标记与 [image: id] 占位行
+_CAPTION_MARK = "Image Caption:"
+_IMGLINE_RE = re.compile(r"^\[image:\s*([0-9a-f]+)\]$")
+
+
+def chunk_turn(row: Dict) -> List[Dict]:
+    """大块 turn（多行 '[ts] role: ...'）→ 检索单元列表。
+
+    - msg 单元：一条消息一行起（前缀行），其后续非前缀行归属该消息（保留原文含 [ts] role 前缀）
+    - caption 单元：行内含 'Image Caption:' 的文本抽出独立成行（消息行不删原文，允许重复语义），
+      其后 1~2 行内匹配 [image: id] 则附引用；同 turn 重复 caption 去重；<8 字符噪声过滤
+    - 单元继承 user_id/session_id；ts=消息级时间戳（无则回退父行）；parent=父 request_id
+    - 自适应：len(text) < CHUNK_MIN_CHARS 时整块返回不切（小 turn 切分会斩断问答配对，
+      L2 实测 −0.11 F1；大块切分治稀释，L1 direct 13/13）
+    """
+    if len(row["text"]) < CHUNK_MIN_CHARS:
+        return [{**{k: row.get(k, "") for k in ("user_id", "session_id", "ts")},
+                 "parent": row.get("request_id", ""), "text": row["text"], "type": "whole"}]
+    lines = row["text"].split("\n")
+    msg_units, cur, cur_ts = [], None, ""
+    ts_at = []  # 每行所属消息的 ts（caption 定位用）
+    for ln in lines:
+        if _PREFIX_RE.match(ln):
+            if cur is not None:
+                msg_units.append((cur_ts, "\n".join(cur)))
+            end = ln.find("]")
+            cur_ts = ln[1:end] if end > 0 else str(row.get("ts", ""))
+            cur = [ln]
+        elif cur is not None:
+            cur.append(ln)
+        ts_at.append(cur_ts)
+    if cur is not None:
+        msg_units.append((cur_ts, "\n".join(cur)))
+
+    base = {"user_id": row.get("user_id", ""), "session_id": row.get("session_id", ""),
+            "parent": row.get("request_id", "")}
+    fallback_ts = str(row.get("ts", ""))
+    out = []
+    for ts, text in msg_units:
+        out.append({**base, "ts": ts or fallback_ts, "text": text, "type": "msg"})
+    seen = set()
+    for i, ln in enumerate(lines):
+        p = ln.find(_CAPTION_MARK)
+        if p < 0:
+            continue
+        cap = ln[p + len(_CAPTION_MARK):].strip()
+        if len(cap) < 8 or cap in seen:
+            continue
+        seen.add(cap)
+        img = ""
+        for j in (i + 1, i + 2):
+            if j < len(lines):
+                mi = _IMGLINE_RE.match(lines[j].strip())
+                if mi:
+                    img = f" (image {mi.group(1)})"
+                    break
+        ts = ts_at[i] or fallback_ts
+        out.append({**base, "ts": ts, "text": f"[{ts}] image{img}: {cap}", "type": "caption"})
+    return out
 
 
 # ================= 原始层快速索引（同步路径，无 LLM，user_id 隔离） =================
 class FastIndex:
-    """turns.jsonl 持久化 + MiniLM 向量 + BM25 混合检索，按 user_id 严格隔离。"""
+    """turns.jsonl 持久化 + 向量 + BM25 混合检索，按 user_id 严格隔离。
+
+    v0.3.0：检索单元粒度（msg/caption），per-user 检索结构缓存（LRU 64），
+    批量编码写入（add_many），大块写入入口 add_turn（内部 chunk_turn 切分）。
+    """
 
     def __init__(self, data_dir: Path):
         self.lock = threading.Lock()
         self.turns: List[Dict] = []
         self.vecs: List[Any] = []
         self.tokens: List[List[str]] = []
+        self._cache: "OrderedDict[str, Dict]" = OrderedDict()  # user -> 检索结构缓存（LRU 16）
+        # 异步编码基础设施：写入即落盘，向量后台批量补齐
+        self._pending: List[int] = []
+        self._enc_lock = threading.Lock()
+        self._enc_event = threading.Event()
         from sentence_transformers import SentenceTransformer
         import numpy as np
         self._np = np
-        self._model = SentenceTransformer("all-MiniLM-L6-v2")
+        self._model = SentenceTransformer(EMBED_MODEL)
+        if EMBED_MAXSEQ > 0:
+            self._model.max_seq_length = EMBED_MAXSEQ
         self._load()
+        self._enc_thread = threading.Thread(target=self._encoder_loop, daemon=True)
+        self._enc_thread.start()
 
     def _load(self):
         np = self._np
@@ -89,81 +179,211 @@ class FastIndex:
                 for line in f:
                     try:
                         t = json.loads(line)
+                        if "text_clean" not in t:
+                            t["text_clean"] = _clean_text(t["text"])
                         self.turns.append(t)
-                        self.tokens.append(self._tokenize(t.get("text_clean") or _clean_text(t["text"])))
+                        self.tokens.append(self._tokenize(t["text_clean"]))
                         v = t.get("vec")
                         if v:
                             self.vecs.append(np.frombuffer(base64.b64decode(v), dtype=np.float32))
+                            t.pop("vec", None)  # b64 串只在磁盘持久化，内存里释放（省 GB 级）
                         else:
                             self.vecs.append(None)
                             missing.append(len(self.turns) - 1)
                     except Exception:
                         continue
-        # 仅对无向量的旧数据重编码（新数据向量随行落盘，重启秒级恢复）
+        # 缺向量的行不阻塞启动：交给后台编码线程补齐（大语料重启即时可用）
         if missing:
-            texts = [self.turns[i].get("text_clean") or _clean_text(self.turns[i]["text"])
-                     for i in missing]
-            vecs = self._model.encode(texts, normalize_embeddings=True,
-                                      show_progress_bar=False)
-            for j, i in enumerate(missing):
-                self.vecs[i] = vecs[j]
+            with self._enc_lock:
+                self._pending.extend(missing)
+                self._enc_event.set()
 
-    @staticmethod
-    def _tokenize(text: str):
-        return re.findall(r"[a-zA-Z0-9]+|[一-鿿]", text.lower())
+    _TOK_POOL: Dict[str, str] = {}  # token 池：zh 单字/bigram 高度重复，intern 后 70 万单元级省 GB 内存
+
+    @classmethod
+    def _tokenize(cls, text: str):
+        """BM25 分词：英文/数字按词；CJK 段输出单字+二元组（中文 IR 标准做法）。
+        全部 token 过池（共享字符串实例），大语料下内存从 ~10KB/单元降到 ~2KB。"""
+        text = text.lower()
+        toks = []
+        pool = cls._TOK_POOL
+        for m in re.finditer(r"[a-zA-Z0-9]+|[一-鿿]+", text):
+            w = m.group(0)
+            if "一" <= w[0] <= "鿿":
+                for ch in w:
+                    toks.append(pool.setdefault(ch, ch))
+                for i in range(len(w) - 1):
+                    bg = w[i:i + 2]
+                    toks.append(pool.setdefault(bg, bg))
+            else:
+                toks.append(pool.setdefault(w, w))
+        return toks
 
     def add(self, turn: Dict):
-        turn["text_clean"] = _clean_text(turn["text"])
-        vec = self._model.encode([turn["text_clean"]], normalize_embeddings=True,
-                                 show_progress_bar=False)[0]
-        turn["vec"] = base64.b64encode(vec.astype(self._np.float32).tobytes()).decode()
+        """单行写入（兼容旧入口；切分路径请用 add_turn）。"""
+        self.add_many([turn])
+
+    def add_many(self, rows: List[Dict]):
+        """同步落盘 + 异步编码：文本/分词即时可检索（BM25 全量生效），
+        向量由后台批处理器补齐（写入期 200 编码/秒需求 vs 同步 20-40/秒——
+        Add 延迟是生死线，编码不是）。磁盘不写 vec，重启后按缺失重编码。"""
+        if not rows:
+            return
         with self.lock:
+            for t in rows:
+                t["text_clean"] = _clean_text(t["text"])
+                t.pop("vec", None)
             with open(TURNS_LOG, "a", encoding="utf-8") as f:
-                f.write(json.dumps(turn, ensure_ascii=False) + "\n")
-            self.turns.append(turn)
-            self.vecs.append(vec)
-            self.tokens.append(self._tokenize(turn["text_clean"]))
+                for t in rows:
+                    f.write(json.dumps(t, ensure_ascii=False) + "\n")
+            start = len(self.turns)
+            self.turns.extend(rows)
+            self.vecs.extend([None] * len(rows))
+            self.tokens.extend(self._tokenize(t["text_clean"]) for t in rows)
+            self._cache.clear()
+        with self._enc_lock:
+            self._pending.extend(range(start, start + len(rows)))
+            self._enc_event.set()
+
+    def _encoder_loop(self):
+        """后台编码线程：批量（64）补齐缺失向量，批间节流失效缓存。"""
+        import numpy as np
+        while True:
+            self._enc_event.wait()
+            with self._enc_lock:
+                batch = self._pending[:64]
+                del self._pending[:64]
+                if not self._pending:
+                    self._enc_event.clear()
+            if not batch:
+                continue
+            texts = [self.turns[i]["text_clean"] for i in batch]
+            try:
+                vecs = self._model.encode(texts, normalize_embeddings=True,
+                                          show_progress_bar=False)
+            except Exception:
+                continue  # 编码失败留待重启重编码，不影响在线
+            with self.lock:
+                for j, i in enumerate(batch):
+                    if i < len(self.vecs) and self.vecs[i] is None:
+                        self.vecs[i] = vecs[j]
+                self._cache.clear()
+
+    def drain(self, timeout: float = 1800.0) -> bool:
+        """等待后台编码排空（benchmark/关停前用；生产不需要等待）。"""
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            with self._enc_lock:
+                if not self._pending:
+                    return True
+            time.sleep(1.0)
+        return False
+
+    def add_turn(self, row: Dict) -> int:
+        """大块 turn 写入入口：chunk_turn 切分为单元后写入。返回单元数。"""
+        units = chunk_turn(row)
+        for i, u in enumerate(units):
+            u["request_id"] = f"{row.get('request_id', 't')}-{i:03d}"
+        self.add_many(units)
+        return len(units)
+
+    def _user_ctx(self, user_id: str) -> Dict:
+        """per-user 检索结构（LRU 64）：idxs + 稠密矩阵堆叠 + BM25 + 父turn分组；行数变化时重建。"""
+        c = self._cache.get(user_id)
+        if c is not None and c["n"] == len(self.turns):
+            self._cache.move_to_end(user_id)
+            return c
+        idxs = [i for i, t in enumerate(self.turns) if t.get("user_id") == user_id]
+        sub_tokens = [self.tokens[i] for i in idxs]
+        bm25 = None
+        if any(sub_tokens):
+            from rank_bm25 import BM25Okapi
+            bm25 = BM25Okapi(sub_tokens)
+        valid = [j for j, i in enumerate(idxs) if self.vecs[i] is not None]
+        mat = (self._np.stack([self.vecs[idxs[j]] for j in valid]), valid) if valid else None
+        # 父 turn 分组（单元按写入顺序排列，列表顺序≈文档顺序）
+        by_parent: Dict[str, List[int]] = {}
+        pos_by_row: Dict[int, Any] = {}
+        for j, i in enumerate(idxs):
+            p = str(self.turns[i].get("parent") or self.turns[i].get("request_id"))
+            by_parent.setdefault(p, []).append(j)
+            pos_by_row[i] = (p, len(by_parent[p]) - 1)
+        c = {"n": len(self.turns), "idxs": idxs, "bm25": bm25, "mat": mat,
+             "by_parent": by_parent, "pos_by_row": pos_by_row}
+        self._cache[user_id] = c
+        if len(self._cache) > 16:  # BGE 1024d 下 64 用户缓存最坏 3.8GB，降到 16
+            self._cache.popitem(last=False)
+        return c
+
+    def _window_content(self, ctx: Dict, parent: str, pos: int, center: int) -> str:
+        """返回证据窗口：命中单元 + 前后各一个 msg 单元（精确匹配靠单元，丰度靠窗口）。"""
+        rows = ctx["by_parent"][parent]
+        sel = [center]
+        for j in range(pos - 1, -1, -1):
+            if self.turns[ctx["idxs"][rows[j]]].get("type") == "msg":
+                sel.insert(0, ctx["idxs"][rows[j]])
+                break
+        for j in range(pos + 1, len(rows)):
+            if self.turns[ctx["idxs"][rows[j]]].get("type") == "msg":
+                sel.append(ctx["idxs"][rows[j]])
+                break
+        text = "\n".join(self.turns[i]["text"] for i in sel)
+        return text[:6000]
 
     def search(self, query: str, user_id: str, k: int = 100) -> List[Dict]:
         np = self._np
         with self.lock:
-            idxs = [i for i, t in enumerate(self.turns)
-                    if t.get("user_id") == user_id]
+            ctx = self._user_ctx(user_id)
+            idxs = ctx["idxs"]
             if not idxs:
                 self._log_query(query, user_id, k, [], 0)
                 return []
             qv = self._model.encode([query], normalize_embeddings=True,
                                     show_progress_bar=False)[0]
-            sub_tokens = [self.tokens[i] for i in idxs]
-            dense = {i: float(np.dot(self.vecs[i], qv)) for i in idxs}
-            tokens_q = self._tokenize(query)
+            dense = {i: 0.0 for i in idxs}
+            if ctx["mat"] is not None:
+                mat, valid = ctx["mat"]
+                sims = mat @ qv
+                for j, s in zip(valid, sims):
+                    dense[idxs[j]] = float(s)
             bm25_s = {i: 0.0 for i in idxs}
-            if any(sub_tokens):
-                from rank_bm25 import BM25Okapi
-                bm25 = BM25Okapi(sub_tokens)
-                s = bm25.get_scores(tokens_q)
+            if ctx["bm25"] is not None:
+                s = ctx["bm25"].get_scores(self._tokenize(query))
                 mx = float(s.max()) if s.size and s.max() > 0 else 0.0
                 for j, i in enumerate(idxs):
-                    # 负分夹到 0（BM25 在小语料上可能为负），正分按 max 归一到 [0,1]
+                    # 负分夹到 0（BM25 小语料可为负），正分按 max 归一 [0,1]
                     bm25_s[i] = max(0.0, float(s[j]) / mx) if mx > 0 else 0.0
             # 混合分下限保护：语义余弦是校准通道，弱词汇证据不应把高语义拉下阈值
             scored = sorted(
-                ((max(0.6 * dense[i] + 0.4 * bm25_s[i], dense[i]), i) for i in idxs),
+                ((max(HYBRID_DENSE * dense[i] + HYBRID_BM25 * bm25_s[i], dense[i]), i) for i in idxs),
                 reverse=True)
             # 阈值过滤前的原始 top 分数（弃答校准：无关查询的真实分数分布）
             raw_top = [(round(sc, 4), str(self.turns[i].get("request_id") or f"turn-{i}"))
                        for sc, i in scored[:8]]
+            # W2 选择策略：单元级打分 → 父 turn 聚合去重（max + 多单元命中加成）→ 窗口返回。
+            passed = [(sc, i) for sc, i in scored if sc >= RELEVANCE_THRESHOLD]
+            turn_agg: Dict[str, List[Any]] = {}  # parent -> [score, best_row, pos, n_hits]
+            for sc, i in passed:
+                parent, pos = ctx["pos_by_row"][i]
+                cur = turn_agg.get(parent)
+                if cur is None:
+                    turn_agg[parent] = [sc, i, pos, 1]
+                else:
+                    cur[3] += 1
+                    if sc > cur[0]:
+                        cur[0], cur[1], cur[2] = sc, i, pos
+            for v in turn_agg.values():
+                v[0] += min(0.02 * (v[3] - 1), 0.06)  # 多单元同时命中：multi_hop/证据对加成
             out = []
-            for rank, (sc, i) in enumerate(scored, 1):
+            for parent, (tsc, i, pos, _nhit) in sorted(turn_agg.items(),
+                                                       key=lambda kv: kv[1][0], reverse=True):
                 if len(out) >= k:
                     break
-                if sc < RELEVANCE_THRESHOLD:
-                    continue  # 低相关结果不返回：无相关记忆时返回空数组，支撑答题侧弃答
                 t = self.turns[i]
                 out.append({
                     "id": str(t.get("request_id") or f"turn-{i}"),
-                    "content": t["text"],
-                    "score": round(max(0.0, min(1.0, sc)), 4),
+                    "content": self._window_content(ctx, parent, pos, i),
+                    "score": round(max(0.0, min(1.0, tsc)), 4),
                     "created_at": t.get("ts", ""),
                 })
             self._log_query(query, user_id, k, raw_top, len(out))
@@ -249,7 +469,7 @@ if SEEN_LOG.exists():
             except Exception:
                 pass
 
-app = FastAPI(title="AML Multimodal Memory Service", version="0.2.9")
+app = FastAPI(title="AML Multimodal Memory Service", version="0.3.0")
 
 
 def _check_auth(request: Request) -> None:
@@ -282,7 +502,7 @@ def _ts_to_iso(ts) -> str:
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model": LLM_MODEL, "service": "aml-multimodal-v0.2.9",
+    return {"status": "ok", "model": LLM_MODEL, "service": "aml-multimodal-v0.3.0",
             "turns": len(_FAST)}
 
 
@@ -336,8 +556,8 @@ async def memory_add(request: Request):
     text = "\n".join(text_parts)
 
     if text:
-        _FAST.add({"request_id": request_id, "user_id": user_id,
-                   "session_id": session_id, "ts": ts_iso, "text": text})
+        _FAST.add_turn({"request_id": request_id, "user_id": user_id,
+                        "session_id": session_id, "ts": ts_iso, "text": text})
 
     with open(SEEN_LOG, "a", encoding="utf-8") as f:
         f.write(json.dumps({"request_id": request_id, "ts": ts_iso}) + "\n")
